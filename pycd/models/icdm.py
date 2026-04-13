@@ -2,6 +2,7 @@ import wandb as wb
 import numpy as np
 import scipy.sparse as sp
 import dgl
+import dgl.nn as dglnn
 # from dgl.nn.pytorch import SAGEConv 原本就是注释
 import torch
 import torch.nn as nn
@@ -14,8 +15,12 @@ import warnings
 from dgl.base import DGLError
 from dgl import function as fn
 from dgl.utils import check_eq_shape, expand_as_pair
-from dgl.nn.pytorch import GATConv, GATv2Conv
+from dgl.nn.pytorch import GATConv, GATv2Conv, GraphConv
 
+# 新增PyTorch Geometric相关导入
+from torch_geometric.nn import SAGEConv, GATv2Conv, GCNConv
+# 导入图格式转换工具（补充文件中的函数）
+from pycd.utils.graph_convert import dgl_to_pyg
 
 from pycd.train.trainer import Trainer, EarlyStopping  #新增早停
 from pycd.utils.logging import init_logger, get_experiment_dir, save_experiment_config #新增保存地址
@@ -587,39 +592,80 @@ class SAGENet(nn.Module):
     def __init__(self, dim, layers_num=2, type='mean', device='cpu', drop=True):
         super(SAGENet, self).__init__()
         self.drop = drop
-        self.type = type
-        self.layers = []
-        for i in range(layers_num):
-            if type == 'mean':
-                self.layers.append(SAGEConv(in_feats=dim, out_feats=dim, aggregator_type=type).to(device))
-            elif type == 'gat':
-                self.layers.append(GATConv(in_feats=dim, out_feats=dim, num_heads=4).to(device))
-            elif type == 'gatv2':
-                self.layers.append(GATv2Conv(in_feats=dim, out_feats=dim, num_heads=4).to(device))
+        self.type = type  # 'mean'(DGL-SAGE)/'gat'(DGL-GAT)/'gatv2'(DGL-GATv2)/'pyg_gatv2'/'pyg_graphsage'/'pyg_gcn'
+        self.device = device
+        self.dim = dim
+        self.layers = nn.ModuleList()  # 用ModuleList统一管理，避免手动append的混乱
+
+        if type == 'gatv2':
+            layer_cls = lambda: dglnn.GATv2Conv(in_feats=dim, out_feats=dim, num_heads=4, allow_zero_in_degree=True)
+            # 2. S_E_wrong：sage_pool（新增SAGE池化聚合）
+        elif type == 'sage_pool':
+            layer_cls = lambda: dglnn.SAGEConv(in_feats=dim, out_feats=dim, aggregator_type='pool')
+            # 3. E_C_right：tag_conv（新增TAGConv，适配高阶依赖）
+        elif type == 'tag_conv':
+            layer_cls = lambda: dglnn.TAGConv(in_feats=dim, out_feats=dim, k=3)  # k=3捕捉3阶邻居
+            # 4. E_C_wrong：dgl_gcn（GraphConv，即基础GCN）
+        elif type == 'dgl_gcn':
+            layer_cls = lambda: dglnn.GraphConv(in_feats=dim, out_feats=dim, allow_zero_in_degree=True)
+            # 5. S_C：sage_gcn（新增SAGE的GCN聚合模式）
+        elif type == 'sage_gcn':
+            layer_cls = lambda: dglnn.SAGEConv(in_feats=dim, out_feats=dim, aggregator_type='gcn')
+            # 保留原有分支（兼容其他场景）
+        elif type == 'mean':
+            layer_cls = lambda: dglnn.SAGEConv(in_feats=dim, out_feats=dim, aggregator_type='mean')
+        elif type == 'gat':
+            layer_cls = lambda: dglnn.GATConv(in_feats=dim, out_feats=dim, num_heads=4)
+        # 硬编码：PyG层（完全独立）
+        elif type == 'pyg_gatv2':
+            layer_cls = lambda: GATv2Conv(in_channels=dim, out_channels=dim, heads=4, concat=False)
+        elif type == 'pyg_graphsage':
+            layer_cls = lambda: SAGEConv(in_feats=dim, out_feats=dim, aggregator_type='mean')
+        elif type == 'pyg_gcn':
+            layer_cls = lambda: GCNConv(in_channels=dim, out_channels=dim)
+        else:
+            raise ValueError(f"Unknown type: {type}")
+
+        # 初始化layers
+        for _ in range(layers_num):
+            self.layers.append(layer_cls().to(device))
 
     def forward(self, g, h):
-        outs = [h]
-        tmp = h
+        outs = [h]  # 初始特征：[N, dim]（2维）
+        tmp = h.to(self.device)
         from dgl import DropEdge
+
         for index, layer in enumerate(self.layers):
             drop = DropEdge(p=0.05 + 0.1 * index)
-            if self.drop:
-                if self.training:
-                    g = drop(g)
-                if self.type != 'mean':
-                    g = dgl.add_self_loop(g)
-                    tmp = torch.mean(layer(g, tmp), dim=1)
-                else:
-                    tmp = layer(g, tmp)
+            if self.drop and self.training:
+                g = drop(g)
+
+            # ------------------- PyG 卷积逻辑（保留） -------------------
+            if self.type.startswith('pyg_'):
+                pyg_data = dgl_to_pyg(g, tmp)
+                pyg_x = F.dropout(pyg_data.x, p=0.05 + 0.1 * index) if (self.drop and self.training) else pyg_data.x
+                tmp = layer(pyg_x, pyg_data.edge_index)
+                tmp = tmp.to(self.device)
+            # ------------------- DGL 卷积逻辑（核心修正） -------------------
             else:
-                if self.type != 'mean':
+                # 为需要的卷积层添加自环
+                if self.type in ['dgl_gcn', 'tag_conv', 'sage_gcn', 'gatv2', 'gat']:
                     g = dgl.add_self_loop(g)
-                    tmp = torch.mean(layer(g, tmp), dim=1)
-                else:
-                    tmp = layer(g, tmp)
+
+                # 执行卷积层前向
+                tmp = layer(g, tmp)
+
+                # 关键：压缩多头注意力的维度（GAT/GATv2专用）
+                if self.type in ['gatv2', 'gat']:
+                    # 多头输出：[N, num_heads, dim] → 平均后：[N, dim]
+                    tmp = torch.mean(tmp, dim=1)
+
+            # 确保tmp始终是2维（[N, dim]），与初始h维度一致
+            assert len(tmp.shape) == 2, f"tmp维度错误：{tmp.shape}，应为[N, {self.dim}]"
             outs.append(tmp / (1 + index))
-        res = torch.sum(torch.stack(
-            outs, dim=1), dim=1)
+
+        # 堆叠并求和（此时所有张量都是2维，尺寸一致）
+        res = torch.sum(torch.stack(outs, dim=1), dim=1)
         return res
 
 
@@ -645,11 +691,11 @@ class IGNet(nn.Module):
         self.global_user = nn.Parameter(torch.zeros(size=(1, self.dim)))
         self.gcn_layers = gcnlayers
 
-        self.S_E_right = SAGENet(dim=self.dim, type=agg_type, device=device, layers_num=self.khop)
-        self.S_E_wrong = SAGENet(dim=self.dim, type=agg_type, device=device, layers_num=self.khop)
-        self.E_C_right = SAGENet(dim=self.dim, type=agg_type, device=device, layers_num=self.khop)
-        self.E_C_wrong = SAGENet(dim=self.dim, type=agg_type, device=device, layers_num=self.khop)
-        self.S_C = SAGENet(dim=self.dim, type=agg_type, device=device, layers_num=self.khop)
+        self.S_E_right = SAGENet(dim=self.dim, type='gatv2', device=device, layers_num=self.khop)
+        self.S_E_wrong = SAGENet(dim=self.dim, type='sage_pool', device=device, layers_num=self.khop)
+        self.E_C_right = SAGENet(dim=self.dim, type='tag_conv', device=device, layers_num=self.khop)
+        self.E_C_wrong = SAGENet(dim=self.dim, type='dgl_gcn', device=device, layers_num=self.khop)
+        self.S_C = SAGENet(dim=self.dim, type='sage_gcn', device=device, layers_num=self.khop)
 
         self.attn_S = Attn(self.dim, attn_drop=0.2)
         self.attn_E_right = Attn(self.dim, attn_drop=0.2)
